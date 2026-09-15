@@ -1262,3 +1262,483 @@ async def show_txt2html_help(client: Client, message: Message):
         "<b>📩 ꜱᴇɴᴅ ᴀ .ᴛxᴛ ꜰɪʟᴇ ᴛᴏ ɢᴇᴛ ꜱᴛᴀʀᴛᴇᴅ!</b>"
     )
 
+import os
+import sys
+import re
+import json
+import asyncio
+import logging
+import time
+from datetime import datetime
+from base64 import b64decode
+import aiohttp
+import pytz
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+
+from pyrogram import Client, filters
+from pyrogram.types import Message
+import config
+
+# Timezone Setup
+india_timezone = pytz.timezone('Asia/Kolkata')
+current_time = datetime.now(india_timezone)
+time_new = current_time.strftime("%d-%m-%Y %I:%M %p")
+
+# Rate limit कंट्रोल करने के लिए (सर्वर 429 एरर न दे)
+SEMAPHORE = asyncio.Semaphore(3)
+
+
+def appx_decrypt(enc: str) -> str:
+    """Appx के AES encrypted links को decrypt करने के लिए"""
+    if not enc:
+        return ""
+    try:
+        raw_enc = b64decode(enc.split(':')[0])
+        if len(raw_enc) == 0:
+            return ""
+        key = '638udh3829162018'.encode('utf-8')
+        iv = 'fedcba9876543210'.encode('utf-8')
+
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        plaintext = unpad(cipher.decrypt(raw_enc), AES.block_size)
+        return plaintext.decode('utf-8')
+    except Exception as e:
+        logging.error(f"Decryption error: {e}")
+        return ""
+
+
+async def fetch_appx_html_to_json(session: aiohttp.ClientSession, url: str, headers: dict = None, data: dict = None, retries: int = 5):
+    """JSON fetch करने और Error पर Retry करने के लिए"""
+    async with SEMAPHORE:
+        await asyncio.sleep(0.4)
+        for attempt in range(retries):
+            try:
+                if data:
+                    async with session.post(url, headers=headers, data=data) as response:
+                        text = await response.text()
+                        status = response.status
+                else:
+                    async with session.get(url, headers=headers) as response:
+                        text = await response.text()
+                        status = response.status
+
+                if status == 429 or "Too Many Requests" in text:
+                    wait_time = (attempt + 1) * 3
+                    logging.warning(f"[429 Rate Limit] Retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    match = re.search(r'\{"status":', text, re.DOTALL)
+                    if match:
+                        json_str = text[match.start():]
+                        open_braces = 0
+                        close_braces = 0
+                        json_end = -1
+
+                        for i, char in enumerate(json_str):
+                            if char == '{':
+                                open_braces += 1
+                            elif char == '}':
+                                close_braces += 1
+
+                            if open_braces > 0 and open_braces == close_braces:
+                                json_end = i + 1
+                                break
+
+                        if json_end != -1:
+                            return json.loads(json_str[:json_end])
+
+                    return None
+
+            except Exception as e:
+                logging.error(f"Network error on {url}: {e}")
+                await asyncio.sleep(2)
+
+        return None
+
+
+async def fetch_appx_video_id_details_v2(session, api, selected_batch_id, video_id, ytFlag, headers, folder_wise_course, user_id):
+    """V2 Folder Video Details Fetcher"""
+    output = []
+    try:
+        url = f"{api}/get/fetchVideoDetailsById?course_id={selected_batch_id}&folder_wise_course={folder_wise_course}&ytflag={ytFlag}&video_id={video_id}"
+        res = await fetch_appx_html_to_json(session, url, headers)
+        if res and res.get("data"):
+            data = res["data"]
+            title = data.get("Title", "Video")
+
+            drm_res = await fetch_appx_html_to_json(session, f"{api}/get/get_mpd_drm_links?folder_wise_course={folder_wise_course}&videoid={video_id}", headers)
+            if drm_res and drm_res.get("data"):
+                drm_data = drm_res.get("data", [])
+                if isinstance(drm_data, list) and len(drm_data) > 0:
+                    path = appx_decrypt(drm_data[0].get("path", "")) if drm_data[0].get("path") else None
+                    if path:
+                        output.append(f"{title}:{path}\n")
+
+            for pdf_key, enc_key in [("pdf_link", "pdf_encryption_key"), ("pdf_link2", "pdf2_encryption_key")]:
+                pdf_link = appx_decrypt(data.get(pdf_key, "")) if data.get(pdf_key) and appx_decrypt(data.get(pdf_key)).endswith(".pdf") else None
+                if pdf_link:
+                    is_enc = data.get(f"is_{pdf_key[:4]}_encrypted", 0)
+                    if is_enc in (1, "1"):
+                        key = appx_decrypt(data.get(enc_key, "")) if data.get(enc_key) else None
+                        output.append(f"{title}:{pdf_link}*{key}\n" if key else f"{title}:{pdf_link}\n")
+                    else:
+                        output.append(f"{title}:{pdf_link}\n")
+    except Exception as e:
+        logging.error(f"Error fetching V2 video details: {e}")
+    return output
+
+
+async def fetch_appx_video_id_details_v3(session, api, selected_batch_id, video_id, ytFlag, headers, user_id):
+    """V3 Folder Video Details Fetcher"""
+    output = []
+    try:
+        res = await fetch_appx_html_to_json(session, f"{api}/get/fetchVideoDetailsById?course_id={selected_batch_id}&folder_wise_course=0&ytflag={ytFlag}&video_id={video_id}", headers)
+        if res and res.get('data'):
+            data = res['data']
+            title = data.get("Title", "Video")
+
+            drm_res = await fetch_appx_html_to_json(session, f"{api}/get/get_mpd_drm_links?folder_wise_course=0&videoid={video_id}", headers)
+            if drm_res and drm_res.get('data'):
+                drm_data = drm_res.get('data', [])
+                if isinstance(drm_data, list) and len(drm_data) > 0:
+                    path = appx_decrypt(drm_data[0].get("path", "")) if drm_data[0].get("path") else None
+                    if path:
+                        output.append(f"{title}:{path}\n")
+
+            pdf_link = appx_decrypt(data.get("pdf_link", "")) if data.get("pdf_link") and appx_decrypt(data.get("pdf_link")).endswith(".pdf") else None
+            if pdf_link:
+                if data.get("is_pdf_encrypted") in (1, "1"):
+                    key = appx_decrypt(data.get("pdf_encryption_key", "")) if data.get("pdf_encryption_key") else None
+                    output.append(f"{title}:{pdf_link}*{key}\n" if key else f"{title}:{pdf_link}\n")
+                else:
+                    output.append(f"{title}:{pdf_link}\n")
+    except Exception as e:
+        logging.error(f"Error fetching V3 video details: {e}")
+    return output
+
+
+async def fetch_appx_folder_contents_v2(session, api, selected_batch_id, folder_id, headers, folder_wise_course, user_id):
+    try:
+        res = await fetch_appx_html_to_json(session, f"{api}/get/folder_contentsv2?course_id={selected_batch_id}&parent_id={folder_id}", headers)
+        tasks = []
+        output = []
+
+        if res and "data" in res:
+            for item in res["data"]:
+                title = item.get("Title", "")
+                video_id = item.get("id")
+                yt_flag = item.get("ytFlag", 0)
+                material_type = item.get("material_type", "")
+
+                if material_type == "VIDEO" and video_id:
+                    tasks.append(fetch_appx_video_id_details_v2(session, api, selected_batch_id, video_id, yt_flag, headers, folder_wise_course, user_id))
+
+                elif material_type in ("PDF", "TEST"):
+                    pdf_link = appx_decrypt(item.get("pdf_link", "")) if item.get("pdf_link") and appx_decrypt(item.get("pdf_link")).endswith(".pdf") else None
+                    if pdf_link:
+                        if item.get("is_pdf_encrypted") in (1, "1"):
+                            key = appx_decrypt(item.get("pdf_encryption_key", "")) if item.get("pdf_encryption_key") else None
+                            output.append(f"{title} PDF:{pdf_link}*{key}\n" if key else f"{title} PDF:{pdf_link}\n")
+                        else:
+                            output.append(f"{title} PDF:{pdf_link}\n")
+
+                elif material_type == "IMAGE":
+                    thumbnail = item.get("thumbnail")
+                    if thumbnail:
+                        output.append(f"{title} IMAGE:{thumbnail}\n")
+
+                elif material_type == "FOLDER":
+                    folder_results = await fetch_appx_folder_contents_v2(session, api, selected_batch_id, item.get("id"), headers, folder_wise_course, user_id)
+                    if folder_results:
+                        output.extend(folder_results)
+
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            for r in results:
+                if r:
+                    output.extend(r)
+
+        return output
+    except Exception as e:
+        logging.error(f"Folder contents error: {e}")
+        return []
+
+
+def find_appx_matching_apis(search_api: list, appxapis_file: str = "appxapis.json") -> list:
+    matched_apis = []
+    try:
+        with open(appxapis_file, 'r') as f:
+            api_data = json.load(f)
+    except Exception:
+        return matched_apis
+
+    for item in api_data:
+        for term in search_api:
+            term = term.strip().lower()
+            if term in item.get("name", "").lower() or term in item.get("api", "").lower():
+                matched_apis.append(item)
+
+    unique_apis = []
+    seen = set()
+    for item in matched_apis:
+        if item["api"] not in seen:
+            unique_apis.append(item)
+            seen.add(item["api"])
+
+    return unique_apis
+
+
+async def process_folder_wise_course_0(session, api, selected_batch_id, headers, user_id):
+    res = await fetch_appx_html_to_json(session, f"{api}/get/allsubjectfrmlivecourseclass?courseid={selected_batch_id}&start=-1", headers)
+    all_outputs = []
+    tasks = []
+
+    if res and "data" in res:
+        for subject in res["data"]:
+            subjectid = subject.get("subjectid")
+            res2 = await fetch_appx_html_to_json(session, f"{api}/get/alltopicfrmlivecourseclass?courseid={selected_batch_id}&subjectid={subjectid}&start=-1", headers)
+            if res2 and "data" in res2:
+                for topic in res2["data"]:
+                    topicid = topic.get("topicid")
+                    res3 = await fetch_appx_html_to_json(session, f"{api}/get/livecourseclassbycoursesubtopconceptapiv3?topicid={topicid}&start=-1&courseid={selected_batch_id}&subjectid={subjectid}", headers)
+                    if res3 and "data" in res3:
+                        for item in res3["data"]:
+                            title = item.get("Title")
+                            video_id = item.get("id")
+                            yt_flag = item.get("ytFlag")
+                            material_type = item.get("material_type")
+
+                            if material_type in ("PDF", "TEST"):
+                                pdf_link = appx_decrypt(item.get("pdf_link", "")) if item.get("pdf_link") and appx_decrypt(item.get("pdf_link")).endswith(".pdf") else None
+                                if pdf_link:
+                                    if item.get("is_pdf_encrypted") in (1, "1"):
+                                        key = appx_decrypt(item.get("pdf_encryption_key"))
+                                        all_outputs.append(f"{title}:{pdf_link}*{key}\n" if key else f"{title}:{pdf_link}\n")
+                                    else:
+                                        all_outputs.append(f"{title}:{pdf_link}\n")
+
+                            elif material_type == "VIDEO" and selected_batch_id and video_id and yt_flag is not None:
+                                tasks.append(fetch_appx_video_id_details_v3(session, api, selected_batch_id, video_id, yt_flag, headers, user_id))
+
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for r in results:
+            all_outputs.extend(r)
+
+    return all_outputs
+
+
+async def process_folder_wise_course_1(session, api, selected_batch_id, headers, user_id):
+    res = await fetch_appx_html_to_json(session, f"{api}/get/folder_contentsv2?course_id={selected_batch_id}&parent_id=-1", headers)
+    all_outputs = []
+    tasks = []
+
+    if res and "data" in res:
+        for item in res["data"]:
+            title = item.get("Title")
+            video_id = item.get("id")
+            yt_flag = item.get("ytFlag")
+            material_type = item.get("material_type")
+
+            if material_type in ("PDF", "TEST"):
+                pdf_link = appx_decrypt(item.get("pdf_link", "")) if item.get("pdf_link") and appx_decrypt(item.get("pdf_link")).endswith(".pdf") else None
+                if pdf_link:
+                    if item.get("is_pdf_encrypted") in (1, "1"):
+                        key = appx_decrypt(item.get("pdf_encryption_key"))
+                        all_outputs.append(f"{title}:{pdf_link}*{key}\n" if key else f"{title}:{pdf_link}\n")
+                    else:
+                        all_outputs.append(f"{title}:{pdf_link}\n")
+
+            elif material_type == "IMAGE":
+                thumbnail = item.get("thumbnail")
+                if thumbnail:
+                    all_outputs.append(f"{title}:{thumbnail}\n")
+
+            elif material_type == "VIDEO":
+                tasks.append(fetch_appx_video_id_details_v2(session, api, selected_batch_id, video_id, yt_flag, headers, 1, user_id))
+
+            elif material_type == "FOLDER":
+                tasks.append(fetch_appx_folder_contents_v2(session, api, selected_batch_id, item.get("id"), headers, 1, user_id))
+
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for r in results:
+            all_outputs.extend(r)
+
+    return all_outputs
+
+
+async def process_appxwp(bot: Client, m: Message, user_id: int):
+    connector = aiohttp.TCPConnector(limit=100)
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        editable = await m.reply_text("Enter App Name Or Api")
+
+        try:
+            input1 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+            api = input1.text
+            await input1.delete(True)
+        except Exception:
+            await editable.edit("Timeout! You took too long to respond.")
+            return
+
+        if not (api.startswith("http://") or api.startswith("https://")):
+            search_api = [term.strip() for term in api.split()]
+            matches = find_appx_matching_apis(search_api)
+
+            if matches:
+                text = "".join([f"{cnt + 1}. {item['name']}:{item['api']}\n" for cnt, item in enumerate(matches)])
+                await editable.edit(f"Send index number of the Batch to download.\n\n{text}")
+
+                try:
+                    input2 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                    raw_index = input2.text.strip()
+                    await input2.delete(True)
+                except Exception:
+                    await editable.edit("Timeout! You took too long to respond.")
+                    return
+
+                if raw_index.isdigit() and 1 <= int(raw_index) <= len(matches):
+                    item = matches[int(raw_index) - 1]
+                    api = item['api']
+                    selected_app_name = item['name']
+                else:
+                    await editable.edit("Error: Invalid Index Number")
+                    return
+            else:
+                await editable.edit("No matches found. Enter correct App name.")
+                return
+        else:
+            api = "https://" + api.replace("https://", "").replace("http://", "").rstrip("/")
+            selected_app_name = api
+
+        token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpZCI6IjEwMTU1NTYyIiwidGVuYW50VHlwZSI6InVzZXIifQ.EfwLhNtbzUVs1qRkMqc3P6ObkKSO0VYWKdAe6GmhdAg"
+        userid = "10155562"
+
+        headers = {
+            'User-Agent': "okhttp/4.9.1",
+            'Accept-Encoding': "gzip",
+            'client-service': "Appx",
+            'auth-key': "appxapi",
+            'language': "en",
+            'device_type': "ANDROID"
+        }
+
+        await editable.edit("Fetching courses list...")
+
+        res1 = await fetch_appx_html_to_json(session, f"{api}/get/courselist", headers)
+        res2 = await fetch_appx_html_to_json(session, f"{api}/get/courselistnewv2", headers)
+
+        courses1 = res1.get("data", []) if res1 and res1.get('status') == 200 else []
+        courses2 = res2.get("data", []) if res2 and res2.get('status') == 200 else []
+
+        courses = courses1 + courses2
+        total = len(courses)
+
+        if not courses:
+            await editable.edit("No courses found on this server.")
+            return
+
+        text = "".join([f"{cnt + 1}. {c.get('course_name')} - Rs.{c.get('price')}\n" for cnt, c in enumerate(courses)])
+
+        if total > 50:
+            file_path = f"{user_id}_paid_course_details.txt"
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+
+            caption = (
+                f"🎓 <b>PAID COURSES LIST</b> 🎓\n\n"
+                f"📱 <b>APP:</b> {selected_app_name}\n"
+                f"📚 <b>TOTAL COURSES:</b> {total}\n"
+                f"📅 <b>DATE:</b> {time_new} IST\n\n"
+                "Send the index number to download course"
+            )
+
+            await editable.delete(True)
+            msg = await m.reply_document(document=file_path, caption=caption)
+
+            if os.path.exists(file_path):
+                os.remove(file_path)
+
+            try:
+                input5 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                await input5.delete(True)
+            except Exception:
+                await msg.edit("❌ <b>Timeout!</b>\n\nYou took too long to respond.")
+                return
+        else:
+            await editable.edit(f"📚 <b>Available Courses</b>\n\n{text}\n\nSend index number of the course to download.")
+            try:
+                input5 = await bot.listen(chat_id=m.chat.id, filters=filters.user(user_id), timeout=120)
+                await input5.delete(True)
+            except Exception:
+                await editable.edit("❌ <b>Timeout!</b>\n\nYou took too long to respond.")
+                return
+
+        if input5.text.isdigit() and 1 <= int(input5.text) <= len(courses):
+            selected_course = courses[int(input5.text.strip()) - 1]
+            selected_batch_id = selected_course['id']
+            selected_batch_name = selected_course['course_name']
+            folder_wise_course = selected_course.get("folder_wise_course", "")
+            clean_batch_name = re.sub(r'[\\/*?:"<>|]', "-", selected_batch_name)[:244]
+            clean_file_name = f"{user_id}_{clean_batch_name}"
+        else:
+            await m.reply_text("❌ <b>Invalid Index Number!</b>")
+            return
+
+        status_msg = await m.reply_text(f"🔄 <b>Processing Course</b>\n└─ Current: <code>{selected_batch_name}</code>")
+        start_time = time.time()
+
+        auth_headers = {
+            "Client-Service": "Appx",
+            "Auth-Key": "appxapi",
+            "source": "website",
+            "Authorization": token,
+            "User-ID": userid
+        }
+
+        if folder_wise_course == 0:
+            all_outputs = await process_folder_wise_course_0(session, api, selected_batch_id, auth_headers, user_id)
+        elif folder_wise_course == 1:
+            all_outputs = await process_folder_wise_course_1(session, api, selected_batch_id, auth_headers, user_id)
+        else:
+            all_outputs = await process_folder_wise_course_0(session, api, selected_batch_id, auth_headers, user_id)
+            all_outputs.extend(await process_folder_wise_course_1(session, api, selected_batch_id, auth_headers, user_id))
+
+        if all_outputs:
+            out_file = f"{clean_file_name}.txt"
+            with open(out_file, 'w', encoding='utf-8') as f:
+                f.writelines(all_outputs)
+
+            elapsed = time.time() - start_time
+            time_str = f"{elapsed:.2f} seconds" if elapsed < 60 else f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+
+            await m.reply_document(
+                document=out_file,
+                caption=f"✅ <b>Extraction Complete!</b>\n⏱️ <b>Time Taken:</b> {time_str}"
+            )
+            if os.path.exists(out_file):
+                os.remove(out_file)
+        else:
+            await status_msg.edit("❌ <b>No readable content or media links found for this course.</b>")
+
+
+# --- BOT RUNNER START ---
+app = Client(
+    "appx_bot",
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    bot_token=config.BOT_TOKEN
+)
+
+@app.on_message(filters.command("appx"))
+async def handle_appx(client, message):
+    await process_appxwp(client, message, message.from_user.id)
+
+if __name__ == "__main__":
+    app.run()
