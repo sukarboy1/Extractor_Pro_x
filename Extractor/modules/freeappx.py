@@ -77,47 +77,52 @@ async def fetch_appx_html_to_json(session, url, headers=None, data=None):
                             break
 
                     if json_end != -1:
-                        return json.loads(json_str[:json_end])
-                    else:
-                        logging.error("Could not find matching closing brace } . json string: ", json_str)
-                        return None
-                except json.JSONDecodeError:
-                    logging.error("Could not parse JSON from the end. ", json_str)
-                    return None
-            else:
-                logging.error("Could not find JSON at the end. Response content: ", text)
-                return None
-    except Exception as e:
-        logging.exception(f"An error occurred during the request: {e}")
-        return None
+                        import asyncio
+import logging
+import json
 
+# Max 3 concurrent requests to prevent 429 Too Many Requests
+SEMAPHORE = asyncio.Semaphore(3)
 
-async def fetch_appx_video_id_details_v2(session, api, selected_batch_id, video_id, ytFlag, headers, folder_wise_course, user_id):
-    logging.info(f"User ID: {user_id} - Fetching video details for video ID: {video_id}")
-    try:
-        res = await fetch_appx_html_to_json(session, f"{api}/get/fetchVideoDetailsById?course_id={selected_batch_id}&folder_wise_course={folder_wise_course}&ytflag={ytFlag}&video_id={video_id}", headers)
-
-        output = []
-        if res:
-            data = res.get('data', [])
-
-            if data:
-                Title = data["Title"]
-                uhs_version = data["uhs_version"]
+async def fetch_appx_html_to_json(session, url, headers, retries=5):
+    """Fetch JSON with automatic retry mechanism on 429 Rate Limit."""
+    for attempt in range(retries):
+        try:
+            async with session.get(url, headers=headers) as response:
+                text = await response.text()
                 
-                res = await fetch_appx_html_to_json(session, f"{api}/get/get_mpd_drm_links?videoid={video_id}&folder_wise_course={folder_wise_course}", headers)
-                if res:
-                    drm_data = res.get('data', [])
-                    if drm_data and isinstance(drm_data, list) and len(drm_data) > 0:
-                        path = appx_decrypt(drm_data[0].get("path", "")) if drm_data and isinstance(drm_data, list) and drm_data and drm_data[0].get("path") else None
-                            
-                        if path:
-                            output.append(f"{Title}:{path}\n")
-                                
-                pdf_link = appx_decrypt(data.get("pdf_link", "")) if data.get("pdf_link", "") and appx_decrypt(data.get("pdf_link", "")).endswith(".pdf") else None
+                # Handling Rate Limit (429 / Too Many Requests)
+                if response.status == 429 or "Too Many Requests" in text:
+                    wait_time = (attempt + 1) * 3  # Time: 3s, 6s, 9s... badhega
+                    logging.warning(f"[429 Rate Limit] Retrying in {wait_time}s... (Attempt {attempt + 1}/{retries})")
+                    await asyncio.sleep(wait_time)
+                    continue
+                
+                # Attempting standard JSON parsing
+                try:
+                    return await response.json()
+                except Exception:
+                    # Fallback for embedded JSON in response text
+                    json_start = text.find('{')
+                    json_end = text.rfind('}') + 1
+                    if json_start != -1 and json_end != -1:
+                        return json.loads(text[json_start:json_end])
+                    
+                    logging.error(f"Could not parse JSON response. Snippet: {text[:200]}")
+                    return None
 
-                is_pdf_encrypted = data.get("is_pdf_encrypted", 0)
-                if pdf_link:
+        except Exception as e:
+            logging.error(f"Network error on {url}: {e}")
+            await asyncio.sleep(2)
+            
+    logging.error(f"Max retries reached for: {url}")
+    return None
+
+async def fetch_with_semaphore(session, url, headers):
+    """Wraps requests inside a semaphore with a micro-delay."""
+    async with SEMAPHORE:
+        await asyncio.sleep(0.4)  # Request ke beech me 0.4s ka gap
+        return await fetch_appx_html_to_json(session, url, headers)
                     if is_pdf_encrypted == 1 or is_pdf_encrypted == "1":
                         key = appx_decrypt(data.get("pdf_encryption_key", "")) if data.get("pdf_encryption_key") else None
                         if key:
